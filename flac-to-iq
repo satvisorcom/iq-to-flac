@@ -8,23 +8,62 @@ Usage: flac-to-iq [OPTIONS] INPUT OUTPUT
 Decode a FLAC-encoded IQ file back to raw IQ samples.
 
 Options:
-  -i, --info    Show IQ metadata and exit (don't decode)
-  -h, --help    Show this help
+  --format FMT   Output format: cs8, cs16, cs32, cu8, w16, ziq (default: signed, matching FLAC bps)
+  --zstd-level N ZSTD compression level for ZIQ output: 0 = none, 1-19 (default: 1)
+  -i, --info     Show IQ metadata and exit (don't decode)
+  -h, --help     Show this help
 
-Output is raw interleaved IQ (I,Q,I,Q,...), signed, little-endian.
+Formats:
+  cs8    Signed 8-bit interleaved IQ
+  cs16   Signed 16-bit little-endian interleaved IQ
+  cs32   Signed 32-bit little-endian interleaved IQ
+  cu8    Unsigned 8-bit interleaved IQ (converted from signed)
+  w16    WAV 16-bit (sample rate from IQ_SAMPLE_RATE metadata)
+  ziq    SatDump ZIQ (ZSTD-compressed by default, requires zstd)
 EOF
     exit "${1:-0}"
 }
 
+# Write a uint64 in little-endian to stdout
+write_u64le() {
+    local n=$1
+    local i
+    for i in $(seq 0 7); do
+        printf "\\$(printf '%03o' $((n & 0xFF)))"
+        n=$((n >> 8))
+    done
+}
+
+# Write a uint32 in little-endian to stdout
+write_u32le() {
+    local n=$1
+    local i
+    for i in $(seq 0 3); do
+        printf "\\$(printf '%03o' $((n & 0xFF)))"
+        n=$((n >> 8))
+    done
+}
+
+# Write a uint16 in little-endian to stdout
+write_u16le() {
+    local n=$1
+    printf "\\$(printf '%03o' $((n & 0xFF)))"
+    printf "\\$(printf '%03o' $(((n >> 8) & 0xFF)))"
+}
+
+format=""
 info_only=false
+zstd_level=1
 positional=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -i|--info) info_only=true; shift ;;
-        -h|--help) usage 0 ;;
-        -*)        echo "Unknown option: $1" >&2; usage 1 ;;
-        *)         positional+=("$1"); shift ;;
+        --format)       format="$2"; shift 2 ;;
+        --zstd-level)   zstd_level="$2"; shift 2 ;;
+        -i|--info)      info_only=true; shift ;;
+        -h|--help)      usage 0 ;;
+        -*)             echo "Unknown option: $1" >&2; usage 1 ;;
+        *)              positional+=("$1"); shift ;;
     esac
 done
 
@@ -51,8 +90,98 @@ fi
 input="${positional[0]}"
 output="${positional[1]}"
 
-flac -d --force-raw-format \
-    --endian=little \
-    --sign=signed \
-    -o "$output" \
-    "$input"
+if [[ "$format" == "w16" ]]; then
+    bps=$(metaflac --show-bps "$input")
+    total_samples=$(metaflac --show-total-samples "$input")
+    samplerate=$(metaflac --show-tag=IQ_SAMPLE_RATE "$input" 2>/dev/null | sed 's/IQ_SAMPLE_RATE=//' || echo 48000)
+    samplerate="${samplerate:-48000}"
+
+    channels=2
+    bytes_per_sample=$((bps / 8))
+    block_align=$((channels * bytes_per_sample))
+    byte_rate=$((samplerate * block_align))
+    data_size=$((total_samples * block_align))
+    file_size=$((36 + data_size))
+
+    # Write WAV header (44 bytes)
+    {
+        printf 'RIFF'
+        write_u32le "$file_size"
+        printf 'WAVEfmt '
+        write_u32le 16                    # fmt chunk size
+        write_u16le 1                     # PCM format
+        write_u16le "$channels"
+        write_u32le "$samplerate"
+        write_u32le "$byte_rate"
+        write_u16le "$block_align"
+        write_u16le "$bps"
+        printf 'data'
+        write_u32le "$data_size"
+    } > "$output"
+
+    # Append PCM data
+    flac -d --force-raw-format \
+        --endian=little \
+        --sign=signed \
+        -o - \
+        "$input" >> "$output"
+elif [[ "$format" == "cu8" ]]; then
+    flac -d --force-raw-format \
+        --endian=little \
+        --sign=signed \
+        -o - \
+        "$input" | tr '\000-\177\200-\377' '\200-\377\000-\177' > "$output"
+elif [[ "$format" == "ziq" ]]; then
+    if [[ "$zstd_level" -gt 0 ]]; then
+        command -v zstd >/dev/null 2>&1 || { echo "Error: zstd is required for compressed ZIQ output" >&2; exit 1; }
+    fi
+
+    bps=$(metaflac --show-bps "$input")
+    samplerate=$(metaflac --show-tag=IQ_SAMPLE_RATE "$input" 2>/dev/null | sed 's/IQ_SAMPLE_RATE=//' || echo 0)
+    freq=$(metaflac --show-tag=IQ_FREQUENCY "$input" 2>/dev/null | sed 's/IQ_FREQUENCY=//' || true)
+    samplerate="${samplerate:-0}"
+
+    # Build annotation JSON
+    annotation=""
+    if [[ -n "$freq" ]]; then
+        annotation="{\"frequency\":$freq}"
+    fi
+    ann_len=${#annotation}
+
+    # Write ZIQ header
+    {
+        printf 'ZIQ_'
+        if [[ "$zstd_level" -gt 0 ]]; then
+            printf '\x01'
+        else
+            printf '\x00'
+        fi
+        printf "\\$(printf '%03o' "$bps")"
+        write_u64le "$samplerate"
+        write_u64le "$ann_len"
+        if [[ $ann_len -gt 0 ]]; then
+            printf '%s' "$annotation"
+        fi
+    } > "$output"
+
+    # Append payload
+    if [[ "$zstd_level" -gt 0 ]]; then
+        flac -d --force-raw-format \
+            --endian=little \
+            --sign=signed \
+            -o - \
+            "$input" | zstd -"$zstd_level" >> "$output"
+    else
+        flac -d --force-raw-format \
+            --endian=little \
+            --sign=signed \
+            -o - \
+            "$input" >> "$output"
+    fi
+else
+    flac -d --force-raw-format \
+        --endian=little \
+        --sign=signed \
+        -o "$output" \
+        "$input"
+fi

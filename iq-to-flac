@@ -8,18 +8,37 @@ Usage: iq-to-flac [OPTIONS] INPUT OUTPUT
 Encode raw IQ samples to FLAC (non-audio mode, sample rate 0).
 
 Options:
-  --bps N            Bits per sample: 8, 16 (default), or 32
-  --sample-rate HZ   IQ sample rate, stored as vorbis comment
-  --frequency HZ     Center frequency, stored as vorbis comment
+  --format FMT       Input format: cs8, cs16 (default), cs32, cu8, w16, ziq
+  --bps N            Bits per sample: 8, 16, or 32 (auto-set by --format)
+  --sample-rate HZ   IQ sample rate, stored as vorbis comment (supports k/M/G suffixes)
+  --frequency HZ     Center frequency, stored as vorbis comment (supports k/M/G suffixes)
   --compression N    FLAC compression level 0-8 (default: 5)
   -h, --help         Show this help
 
-Input is raw interleaved IQ (I,Q,I,Q,...), signed, little-endian.
+Formats:
+  cs8    Signed 8-bit interleaved IQ
+  cs16   Signed 16-bit little-endian interleaved IQ
+  cs32   Signed 32-bit little-endian interleaved IQ
+  cu8    Unsigned 8-bit interleaved IQ (converted to signed)
+  w16    WAV 16-bit (header stripped, encoded as cs16)
+  ziq    SatDump ZIQ (8/16-bit only, auto-reads header, requires zstd)
 EOF
     exit "${1:-0}"
 }
 
-bps=16
+# Parse human-friendly frequency: 5M → 5000000, 1.7G → 1700000000, 600k → 600000
+parse_freq() {
+    local val="$1"
+    case "$val" in
+        *G) echo "$val" | sed 's/G$//' | awk '{printf "%.0f", $1 * 1000000000}' ;;
+        *M) echo "$val" | sed 's/M$//' | awk '{printf "%.0f", $1 * 1000000}' ;;
+        *k) echo "$val" | sed 's/k$//' | awk '{printf "%.0f", $1 * 1000}' ;;
+        *)  echo "$val" ;;
+    esac
+}
+
+format=""
+bps=""
 sample_rate=""
 frequency=""
 compression=5
@@ -27,6 +46,7 @@ positional=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --format)      format="$2"; shift 2 ;;
         --bps)         bps="$2"; shift 2 ;;
         --sample-rate) sample_rate="$2"; shift 2 ;;
         --frequency)   frequency="$2"; shift 2 ;;
@@ -45,26 +65,100 @@ fi
 input="${positional[0]}"
 output="${positional[1]}"
 
+# Expand SI suffixes
+[[ -z "$sample_rate" ]] || sample_rate=$(parse_freq "$sample_rate")
+[[ -z "$frequency" ]] || frequency=$(parse_freq "$frequency")
+
+# Resolve format → bps and conversion mode
+convert=""
+if [[ -n "$format" ]]; then
+    case "$format" in
+        cs8)  bps=8 ;;
+        cs16) bps=16 ;;
+        cs32) bps=32 ;;
+        cu8)  bps=8; convert=cu8 ;;
+        w16)  bps=16; convert=w16 ;;
+        ziq)  convert=ziq ;;
+        *)    echo "Error: unknown format '$format' (use cs8, cs16, cs32, cu8, w16, ziq)" >&2; exit 1 ;;
+    esac
+fi
+
+bps="${bps:-16}"
+
 case "$bps" in
     8|16|32) ;;
     *) echo "Error: --bps must be 8, 16, or 32" >&2; exit 1 ;;
 esac
 
-flac --force-raw-format \
-    --channels=2 \
-    --bps="$bps" \
-    --endian=little \
-    --sign=signed \
-    --sample-rate=0 \
-    --compression-level-"$compression" \
-    -o "$output" \
-    "$input"
+flac_encode() {
+    flac --force-raw-format \
+        --channels=2 \
+        --bps="$bps" \
+        --endian=little \
+        --sign=signed \
+        --sample-rate=0 \
+        --compression-level-"$compression" \
+        -o "$output" \
+        "$@"
+}
+
+case "$convert" in
+    cu8)
+        # XOR 0x80: swap signed/unsigned range via tr byte translation
+        tr '\000-\177\200-\377' '\200-\377\000-\177' < "$input" | flac_encode -
+        ;;
+    w16)
+        # Find the 'data' chunk in WAV header
+        offset=12
+        while true; do
+            chunk_id=$(dd if="$input" bs=1 skip="$offset" count=4 2>/dev/null)
+            [[ ${#chunk_id} -eq 4 ]] || { echo "Error: data chunk not found in WAV" >&2; exit 1; }
+            chunk_size=$(od -A n -t u4 -j $((offset + 4)) -N 4 "$input" | tr -d ' ')
+            if [[ "$chunk_id" == "data" ]]; then
+                break
+            fi
+            offset=$((offset + 8 + chunk_size))
+        done
+        tail -c +$((offset + 9)) "$input" | flac_encode -
+        ;;
+    ziq)
+        # Parse ZIQ header
+        sig=$(dd if="$input" bs=1 count=4 2>/dev/null)
+        [[ "$sig" == "ZIQ_" ]] || { echo "Error: not a ZIQ file" >&2; exit 1; }
+
+        ziq_compressed=$(od -A n -t u1 -j 4 -N 1 "$input" | tr -d ' ')
+        bps=$(od -A n -t u1 -j 5 -N 1 "$input" | tr -d ' ')
+        ziq_samplerate=$(od -A n -t u8 -j 6 -N 8 "$input" | tr -d ' ')
+        ann_len=$(od -A n -t u8 -j 14 -N 8 "$input" | tr -d ' ')
+        ziq_header_size=$((22 + ann_len))
+
+        [[ "$bps" != "32" ]] || { echo "Error: ZIQ 32-bit is IEEE float, not supported by FLAC" >&2; exit 1; }
+
+        sample_rate="${sample_rate:-$ziq_samplerate}"
+
+        # Try to extract frequency from annotation JSON
+        if [[ "$ann_len" -gt 0 && -z "$frequency" ]]; then
+            ann=$(dd if="$input" bs=1 skip=22 count="$ann_len" 2>/dev/null)
+            freq=$(echo "$ann" | grep -o '"frequency"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$' || true)
+            frequency="${freq:-}"
+        fi
+
+        if [[ "$ziq_compressed" -eq 1 ]]; then
+            command -v zstd >/dev/null 2>&1 || { echo "Error: zstd is required for compressed ZIQ files" >&2; exit 1; }
+            tail -c +$((ziq_header_size + 1)) "$input" | zstd -d | flac_encode -
+        else
+            tail -c +$((ziq_header_size + 1)) "$input" | flac_encode -
+        fi
+        ;;
+    *)
+        flac_encode "$input"
+        ;;
+esac
 
 # Add IQ metadata as vorbis comments
 if [[ -n "$sample_rate" ]]; then
     metaflac --set-tag="IQ_SAMPLE_RATE=$sample_rate" "$output"
 fi
 if [[ -n "$frequency" ]]; then
-    metaflac --set-tag="FREQUENCY=$frequency" "$output"
+    metaflac --set-tag="IQ_FREQUENCY=$frequency" "$output"
 fi
-metaflac --set-tag="IQ_BITS_PER_SAMPLE=$bps" "$output"
